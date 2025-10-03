@@ -69,6 +69,9 @@
     <ClInclude Include="YaraManager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="PersistenceMonitor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="XDR.cpp">
@@ -108,6 +111,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="YaraManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PersistenceMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

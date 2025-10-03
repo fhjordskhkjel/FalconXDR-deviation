@@ -3,6 +3,7 @@
 #include "Logger.h"
 #include "MemoryAnalysis.h"
 #include "YaraSupport.h"
+#include "PersistenceMonitor.h" // added
 
 #include <windows.h>
 #include <psapi.h>
@@ -63,6 +64,8 @@ static double Entropy(const uint8_t* d,size_t n){ if(n==0) return 0; uint32_t f[
 static double InstructionDensity(const uint8_t* d,size_t n){ if(n==0) return 0; size_t inst=0; for(size_t i=0;i<n;i++){ switch(d[i]){ case 0x55:case 0x53:case 0x57:case 0x56:case 0x48:case 0x8B:case 0x89:case 0xE8:case 0xE9:case 0xFF:case 0x41:case 0x40:case 0xB8:case 0xB9:case 0xBA:case 0xEB: ++inst; default: break; } } return (double)inst/n; }
 static bool IsWrite(DWORD p){ return p & (PAGE_READWRITE|PAGE_EXECUTE_READWRITE|PAGE_WRITECOPY|PAGE_EXECUTE_WRITECOPY); }
 static bool IsExec(DWORD p){ return p & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY); }
+// unified helper for execute+write (any RWX style) check
+static bool IsExecWrite(DWORD p){ return IsExec(p) && IsWrite(p); }
 static std::wstring ProtToString(DWORD p){ switch(p){ case PAGE_EXECUTE: return L"X"; case PAGE_EXECUTE_READ: return L"RX"; case PAGE_EXECUTE_READWRITE: return L"RWX"; case PAGE_EXECUTE_WRITECOPY: return L"WCX"; case PAGE_READONLY: return L"R"; case PAGE_READWRITE: return L"RW"; case PAGE_WRITECOPY: return L"WC"; case PAGE_NOACCESS: return L"NA"; default: return L"?"; } }
 
 // ================= Alert rate limiting =================
@@ -79,7 +82,34 @@ static std::mutex g_yaraM; static std::vector<YaraTask> g_yaraTasks; static std:
 static void EnqueueYara(DWORD pid, uintptr_t base,size_t size,const std::wstring& ctx){ if(!g_settings.enableYaraRegionScan) return; size=std::min<size_t>(size,g_settings.yaraMaxRegionSize); std::lock_guard lk(g_yaraM); if(g_yaraTasks.size()>512) return; g_yaraTasks.push_back({pid,base,size,ctx, (uint32_t)(size>256*1024?2:1), (uint64_t)GetTickCount64()}); }
 static bool PopYara(YaraTask& out){ std::lock_guard lk(g_yaraM); if(g_yaraTasks.empty()) return false; auto it=std::max_element(g_yaraTasks.begin(),g_yaraTasks.end(),[](auto&a,auto&b){ if(a.prio==b.prio) return a.tick>b.tick; return a.prio<b.prio; }); out=*it; g_yaraTasks.erase(it); return true; }
 static std::atomic<HWND> g_hwndNotify{nullptr};
-static void YaraLoop(){ while(g_yaraRun.load()){ YaraTask t{}; if(PopYara(t)){ TrimYWin(); if(g_yaraByteWindow + t.size > kYaraBytesMin){ t.prio=1; std::lock_guard lk(g_yaraM); g_yaraTasks.push_back(t); std::this_thread::sleep_for(150ms); continue;} HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,t.pid); if(hp){ std::vector<uint8_t> buf(t.size); SIZE_T br=0; ReadProcessMemory(hp,(LPCVOID)t.base,buf.data(),t.size,&br); CloseHandle(hp); if(br){ buf.resize(br); TrimYWin(); g_yaraByteWindow+=br; g_yWin.push_back({steady_clock::now(),br}); std::vector<std::wstring> matches; if(YaraSupport::ScanBuffer(buf.data(),buf.size(),matches)){ std::wstringstream ds; ds<<L"event=yara_region pid="<<t.pid<<L" base=0x"<<std::hex<<t.base<<L" size="<<std::dec<<br<<L" matches="; for(size_t i=0;i<matches.size();++i){ if(i) ds<<L";"; ds<<matches[i]; } ds<<L" ctx="<<t.ctx; std::wstring pname=L"<unknown>"; auto it=g_procs.find(t.pid); if(it!=g_procs.end()) pname=it->second.image; XDR::Event ev; ev.category=XDR::EventCategory::Alert; ev.type=XDR::EventType::AlertYaraMatch; ev.pid=t.pid; ev.image=pname; ev.details=ds.str(); XDR::Storage::Insert(ev); auto line=std::format(L"[{}] ALERT YaraMatch pid={} name={} {}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), t.pid, pname, ds.str()); Logger::Write(line); auto* p=new std::wstring(line); PostMessageW(g_hwndNotify.load(),WM_APP+2,(WPARAM)p,0); } } } } else std::this_thread::sleep_for(120ms); } }
+static void YaraLoop(){
+    while(g_yaraRun.load()){
+        YaraTask t{};
+        if(PopYara(t)){
+            TrimYWin();
+            if(g_yaraByteWindow + t.size > kYaraBytesMin){
+                t.prio=1;
+                std::lock_guard lk(g_yaraM);
+                g_yaraTasks.push_back(t);
+                std::this_thread::sleep_for(150ms);
+                continue;
+            }
+            HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,t.pid);
+            if(hp){
+                std::vector<uint8_t> buf(t.size); SIZE_T br=0;
+                ReadProcessMemory(hp,(LPCVOID)t.base,buf.data(),t.size,&br);
+                CloseHandle(hp);
+                if(br){
+                    buf.resize(br); TrimYWin(); g_yaraByteWindow+=br; g_yWin.push_back({steady_clock::now(),br});
+                    std::vector<std::wstring> matches; if(YaraSupport::ScanBuffer(buf.data(),buf.size(),matches)){
+                        std::wstringstream ds; ds<<L"event=yara_region pid="<<t.pid<<L" base=0x"<<std::hex<<t.base<<L" size="<<std::dec<<br<<L" matches="; for(size_t i=0;i<matches.size();++i){ if(i) ds<<L";"; ds<<matches[i]; } ds<<L" ctx="<<t.ctx; std::wstring pname=L"<unknown>"; auto it=g_procs.find(t.pid); if(it!=g_procs.end()) pname=it->second.image; XDR::Event ev; ev.category=XDR::EventCategory::Alert; ev.type=XDR::EventType::AlertYaraMatch; ev.pid=t.pid; ev.image=pname; ev.details=ds.str(); XDR::Storage::Insert(ev); auto line=std::format(L"[{}] ALERT YaraMatch pid={} name={} {}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), t.pid, pname, ds.str()); Logger::Write(line); auto* p=new std::wstring(line); PostMessageW(g_hwndNotify.load(),WM_APP+2,(WPARAM)p,0); }
+                }
+            }
+        } else {
+            std::this_thread::sleep_for(120ms);
+        }
+    }
+}
 
 // ================= Integrity / privileges =================
 static std::wstring IntegrityLevel(HANDLE h){ HANDLE tok{}; if(!OpenProcessToken(h,TOKEN_QUERY,&tok)) return L"unknown"; DWORD len=0; GetTokenInformation(tok,TokenIntegrityLevel,nullptr,0,&len); std::wstring level=L"unknown"; if(GetLastError()==ERROR_INSUFFICIENT_BUFFER){ auto buf=std::unique_ptr<BYTE[]>(new BYTE[len]); if(GetTokenInformation(tok,TokenIntegrityLevel,buf.get(),len,&len)){ auto til=reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buf.get()); DWORD rid=*GetSidSubAuthority(til->Label.Sid,(DWORD)(*GetSidSubAuthorityCount(til->Label.Sid)-1)); if(rid>=SECURITY_MANDATORY_SYSTEM_RID) level=L"System"; else if(rid>=SECURITY_MANDATORY_HIGH_RID) level=L"High"; else if(rid>=SECURITY_MANDATORY_MEDIUM_RID) level=L"Medium"; else level=L"Low"; }} CloseHandle(tok); return level; }
@@ -94,16 +124,29 @@ static void RefreshModuleRanges(ProcInfo& pi){ auto now=steady_clock::now(); if(
 static bool AddrInModules(const ProcInfo& pi, uintptr_t a){ for(auto &r:pi.moduleRanges) if(a>=r.first && a<r.second) return true; return false; }
 static bool EnumHas(HANDLE h,const std::wstring& n){ HMODULE mods[512]; DWORD need=0; if(!EnumProcessModules(h,mods,sizeof(mods),&need)) return false; size_t cnt=need/sizeof(HMODULE); wchar_t path[MAX_PATH]; auto needle=lower(n); for(size_t i=0;i<cnt;i++){ if(GetModuleFileNameExW(h,mods[i],path,MAX_PATH)){ std::wstring p=lower(path); if(p.find(needle)!=std::wstring::npos) return true; } } return false; }
 
-// ================= Unsigned module =================
-static bool IsModuleSigned(const std::wstring& path){ WINTRUST_FILE_INFO fi{sizeof(fi)}; fi.pcwszFilePath=path.c_str(); GUID action=WINTRUST_ACTION_GENERIC_VERIFY_V2; WINTRUST_DATA wd{sizeof(wd)}; wd.dwUIChoice=WTD_UI_NONE; wd.fdwRevocationChecks=WTD_REVOKE_NONE; wd.dwUnionChoice=WTD_CHOICE_FILE; wd.pFile=&fi; wd.dwStateAction=WTD_STATEACTION_IGNORE; wd.dwProvFlags=WTD_SAFER_FLAG|WTD_HASH_ONLY_FLAG; return WinVerifyTrust(nullptr,&action,&wd)==ERROR_SUCCESS; }
+// ================= Unsigned module (with signature cache) =================
+static std::mutex g_sigCacheMutex; static std::unordered_map<std::wstring,bool> g_sigCache; 
+static bool IsModuleSigned(const std::wstring& path){
+    if(path.empty()) return false;
+    std::wstring norm=lower(path);
+    {
+        std::scoped_lock lk(g_sigCacheMutex);
+        auto it=g_sigCache.find(norm);
+        if(it!=g_sigCache.end()) return it->second;
+    }
+    WINTRUST_FILE_INFO fi{sizeof(fi)}; fi.pcwszFilePath=path.c_str();
+    GUID action=WINTRUST_ACTION_GENERIC_VERIFY_V2; WINTRUST_DATA wd{sizeof(wd)}; wd.dwUIChoice=WTD_UI_NONE; wd.fdwRevocationChecks=WTD_REVOKE_NONE; wd.dwUnionChoice=WTD_CHOICE_FILE; wd.pFile=&fi; wd.dwStateAction=WTD_STATEACTION_IGNORE; wd.dwProvFlags=WTD_SAFER_FLAG|WTD_HASH_ONLY_FLAG; 
+    bool ok = WinVerifyTrust(nullptr,&action,&wd)==ERROR_SUCCESS; 
+    {
+        std::scoped_lock lk(g_sigCacheMutex);
+        g_sigCache.emplace(norm,ok);
+    }
+    return ok; }
 static void CheckUnsignedModules(HWND hwnd, ProcInfo& pi){ if(pi.checkedModules) return; if(!g_settings.enableUnsignedModuleAlert) { pi.checkedModules = true; return; } HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(!h) return; auto &ex=g_extra[pi.pid]; HMODULE mods[512]; DWORD need=0; if(EnumProcessModules(h,mods,sizeof(mods),&need)){ size_t cnt=need/sizeof(HMODULE); wchar_t path[MAX_PATH]; for(size_t i=0;i<cnt;i++){ if(GetModuleFileNameExW(h,mods[i],path,MAX_PATH)){ std::wstring p=path; if(p.empty()||ex.unsignedMods.contains(p)) continue; if(!IsModuleSigned(p)){ ex.unsignedMods.insert(p); if(AlertAllowed(pi.pid,XDR::EventType::AlertUnsignedModule,(uintptr_t)mods[i])){ auto line=std::format(L"[{}] ALERT UnsignedModule pid={} name={} module={} base=0x{}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), pi.pid, pi.image, p,(uintptr_t)mods[i]); Logger::Write(line); XDR::Event ev; ev.category=XDR::EventCategory::Alert; ev.type=XDR::EventType::AlertUnsignedModule; ev.pid=pi.pid; ev.image=pi.image; ev.details=std::format(L"module={} base=0x{}",p,(uintptr_t)mods[i]); XDR::Storage::Insert(ev); auto* msg=new std::wstring(line); PostMessageW(hwnd,WM_APP+2,(WPARAM)msg,0); } } } } } CloseHandle(h); }
 
-// ================= API hook heuristic =================
+// ================= API hook heuristic (original logic, could be refactored to use IsExecWrite) =================
 static bool SuspiciousPrologue(const uint8_t* b,size_t n){ if(n<5) return false; if(b[0]==0xE9||b[0]==0xE8||(b[0]==0xFF&&(b[1]==0x25||b[1]==0x15))) return true; if(b[0]==0x48 && b[1]==0xB8) return true; return false; }
-static void CheckApiHooks(HWND hwnd, ProcInfo& pi){ if(!g_settings.enableApiHookScan) return; auto &ex=g_extra[pi.pid]; if(ex.apiHooksChecked) return; ex.apiHooksChecked=true; HMODULE ntdll=GetModuleHandleW(L"ntdll.dll"); if(!ntdll) return; HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(!h) return; const char* apis[]={"NtOpenProcess","NtWriteVirtualMemory","NtCreateThreadEx","NtAllocateVirtualMemory","NtProtectVirtualMemory"}; for(auto a:apis){ FARPROC fp=GetProcAddress(ntdll,a); if(!fp) continue; uint8_t buf[32]{}; SIZE_T br=0; ReadProcessMemory(h,fp,buf,sizeof(buf),&br); if(br>=5 && SuspiciousPrologue(buf,br)){ if(AlertAllowed(pi.pid,XDR::EventType::AlertApiHook,(uintptr_t)fp)){ std::wstring ws(a,a+strlen(a)); // build bytes hex
-                std::wstringstream bhex; size_t show=std::min<SIZE_T>(br,16); for(size_t i=0;i<show;i++){ if(i) bhex<<L" "; bhex<<std::hex<<std::uppercase<<std::setw(2)<<std::setfill(L'0')<<(int)buf[i]; }
-                std::wstring disasm=L"unknown"; uintptr_t target=0; bool haveTarget=false; if(buf[0]==0xE9 && br>=5){ int32_t rel=*(int32_t*)(buf+1); target=(uintptr_t)fp+5+rel; disasm=std::format(L"jmp 0x{:X}",target); haveTarget=true; } else if(buf[0]==0xE8 && br>=5){ int32_t rel=*(int32_t*)(buf+1); target=(uintptr_t)fp+5+rel; disasm=std::format(L"call 0x{:X}",target); haveTarget=true; } else if(buf[0]==0xFF && buf[1]==0x25 && br>=6){ int32_t rel=*(int32_t*)(buf+2); uintptr_t rip=(uintptr_t)fp+6; uintptr_t ptrAddr=rip+rel; uintptr_t ptrValue=0; SIZE_T tr=0; ReadProcessMemory(h,(LPCVOID)ptrAddr,&ptrValue,sizeof(ptrValue),&tr); if(tr==sizeof(ptrValue)&&ptrValue){ target=ptrValue; disasm=std::format(L"jmp [rip+0x{:X}] -> 0x{:X}",ptrAddr-rip,target); haveTarget=true; } else disasm=std::format(L"jmp [rip+0x{:X}]",ptrAddr-rip); } else if(buf[0]==0x48 && buf[1]==0xB8 && br>=12){ uint64_t imm=*(uint64_t*)(buf+2); if(br>=12 && buf[10]==0xFF && buf[11]==0xE0){ target=(uintptr_t)imm; disasm=std::format(L"mov rax,0x{:X}; jmp rax",target); haveTarget=true; } else disasm=std::format(L"mov rax,0x{:X}", (uint64_t)imm); }
-                auto line=std::format(L"[{}] ALERT ApiHook pid={} name={} api={} addr=0x{} bytes={} {}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), pi.pid, pi.image, ws,(uintptr_t)fp,bhex.str(),disasm); Logger::Write(line); XDR::Event ev; ev.category=XDR::EventCategory::Alert; ev.type=XDR::EventType::AlertApiHook; ev.pid=pi.pid; ev.image=pi.image; ev.details=std::format(L"api={} addr=0x{} bytes={} disasm={}",ws,(uintptr_t)fp,bhex.str(),disasm); XDR::Storage::Insert(ev); auto* msg=new std::wstring(line); PostMessageW(hwnd,WM_APP+2,(WPARAM)msg,0); } } } CloseHandle(h); }
+static void CheckApiHooks(HWND hwnd, ProcInfo& pi){ if(!g_settings.enableApiHookScan) return; auto &ex=g_extra[pi.pid]; if(ex.apiHooksChecked) return; ex.apiHooksChecked=true; HMODULE ntdll=GetModuleHandleW(L"ntdll.dll"); if(!ntdll) return; HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(!h) return; const char* apis[] = {"NtOpenProcess","NtWriteVirtualMemory","NtCreateThreadEx","NtAllocateVirtualMemory","NtProtectVirtualMemory"}; for(const char* a: apis){ FARPROC fp=GetProcAddress(ntdll,a); if(!fp) continue; uint8_t buf[32]{}; SIZE_T br=0; if(!ReadProcessMemory(h,fp,buf,sizeof(buf),&br) || br<5) continue; if(!SuspiciousPrologue(buf,br)) continue; if(!AlertAllowed(pi.pid,XDR::EventType::AlertApiHook,(uintptr_t)fp)) continue; std::wstringstream bhex; size_t show=std::min<SIZE_T>(br,16); for(size_t i=0;i<show;i++){ if(i) bhex<<L" "; bhex<<std::hex<<std::uppercase<<std::setw(2)<<std::setfill(L'0')<<(int)buf[i]; } std::wstring apiName; apiName.assign(a,a+strlen(a)); std::wstring disasm=L"unknown"; uintptr_t target=0; bool haveTarget=false; if(buf[0]==0xE9 && br>=5){ int32_t rel=*reinterpret_cast<const int32_t*>(buf+1); target=(uintptr_t)fp+5+rel; disasm=std::format(L"jmp 0x{:X}",target); haveTarget=true; } else if(buf[0]==0xE8 && br>=5){ int32_t rel=*reinterpret_cast<const int32_t*>(buf+1); target=(uintptr_t)fp+5+rel; disasm=std::format(L"call 0x{:X}",target); haveTarget=true; } else if(buf[0]==0xFF && buf[1]==0x25 && br>=6){ int32_t rel=*reinterpret_cast<const int32_t*>(buf+2); uintptr_t rip=(uintptr_t)fp+6; uintptr_t ptrAddr=rip+rel; uintptr_t ptrValue=0; SIZE_T tr=0; if(ReadProcessMemory(h,(LPCVOID)ptrAddr,&ptrValue,sizeof(ptrValue),&tr) && tr==sizeof(ptrValue) && ptrValue){ target=ptrValue; haveTarget=true; disasm=std::format(L"jmp [rip+0x{:X}] -> 0x{:X}",ptrAddr-rip,target); } else disasm=std::format(L"jmp [rip+0x{:X}]",ptrAddr-rip); } else if(buf[0]==0x48 && buf[1]==0xB8 && br>=12){ uint64_t imm=*reinterpret_cast<const uint64_t*>(buf+2); if(br>=12 && buf[10]==0xFF && buf[11]==0xE0){ target=(uintptr_t)imm; disasm=std::format(L"mov rax,0x{:X}; jmp rax",target); haveTarget=true; } else disasm=std::format(L"mov rax,0x{:X}",(uint64_t)imm); } bool rwxTarget=false; std::wstring tgtProt=L"?"; if(haveTarget){ MEMORY_BASIC_INFORMATION mbi{}; if(VirtualQueryEx(h,(LPCVOID)target,&mbi,sizeof(mbi))==sizeof(mbi)){ DWORD p=mbi.Protect; bool exec=(p & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))!=0; bool write=(p & (PAGE_READWRITE|PAGE_EXECUTE_READWRITE|PAGE_WRITECOPY|PAGE_EXECUTE_WRITECOPY))!=0; if(exec && write) rwxTarget=true; switch(p){ case PAGE_EXECUTE: tgtProt=L"X"; break; case PAGE_EXECUTE_READ: tgtProt=L"RX"; break; case PAGE_EXECUTE_READWRITE: tgtProt=L"RWX"; break; case PAGE_EXECUTE_WRITECOPY: tgtProt=L"WCX"; break; case PAGE_READONLY: tgtProt=L"R"; break; case PAGE_READWRITE: tgtProt=L"RW"; break; case PAGE_WRITECOPY: tgtProt=L"WC"; break; case PAGE_NOACCESS: tgtProt=L"NA"; break; default: tgtProt=L"?"; break; } } } const wchar_t* label = rwxTarget? L"ApiHookSuspicious" : L"ApiHook"; auto line=std::format(L"[{}] ALERT {} pid={} name={} api={} addr=0x{:X} bytes={} {}{}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), label, pi.pid, pi.image, apiName,(uintptr_t)fp,bhex.str(),disasm, rwxTarget?L" (RWX target)":L""); Logger::Write(line); XDR::Event ev; ev.category=XDR::EventCategory::Alert; ev.type=XDR::EventType::AlertApiHook; ev.pid=pi.pid; ev.image=pi.image; ev.details=std::format(L"api={} addr=0x{:X} bytes={} disasm={} target=0x{:X} targetProt={} rwxTarget={}",apiName,(uintptr_t)fp,bhex.str(),disasm,haveTarget?target:0,tgtProt,rwxTarget?1:0); XDR::Storage::Insert(ev); auto* msg=new std::wstring(line); PostMessageW(hwnd,WM_APP+2,(WPARAM)msg,0); } CloseHandle(h); }
 
 // ================= Suspicious exec region classifier =================
 static void ClassifyExecRegions(HWND hwnd, ProcInfo& pi){ if(!g_settings.enableExecRegionClassifier) return; HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(!h) return; auto &ex=g_extra[pi.pid]; MEMORY_BASIC_INFORMATION mbi; unsigned char* addr=nullptr; int scanned=0; while(VirtualQueryEx(h,addr,&mbi,sizeof(mbi))==sizeof(mbi)){ if(mbi.State==MEM_COMMIT && mbi.Type==MEM_PRIVATE && IsExec(mbi.Protect) && !IsWrite(mbi.Protect) && mbi.RegionSize>=0x800){ size_t sample=std::min<SIZE_T>(mbi.RegionSize,4096); std::vector<uint8_t> buf(sample); SIZE_T br=0; if(ReadProcessMemory(h,addr,buf.data(),sample,&br) && br>512){ double ent=Entropy(buf.data(),br); double dens=InstructionDensity(buf.data(),br); uint64_t hsh=Fnv1a64(buf.data(),std::min<size_t>(br,256)); if(!ex.suspiciousExecHashes.contains(hsh) && (ent>7.2 || dens<0.03 || dens>0.6)){ ex.suspiciousExecHashes.insert(hsh); if(AlertAllowed(pi.pid,XDR::EventType::AlertSuspiciousExecRegion,(uintptr_t)addr)){ std::wstringstream ds; ds<<L"event=susp_exec base=0x"<<std::hex<<(uintptr_t)addr<<L" size="<<std::dec<<mbi.RegionSize<<L" ent="<<std::fixed<<std::setprecision(2)<<ent<<L" dens="<<dens<<L" hash=0x"<<std::hex<<hsh; auto line=std::format(L"[{}] ALERT SuspiciousExecRegion pid={} name={} base=0x{} size={} ent={:.2f} dens={:.2f}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), pi.pid, pi.image,(uintptr_t)addr,(SIZE_T)mbi.RegionSize,ent,dens); Logger::Write(line); XDR::Event ev; ev.category=XDR::EventCategory::Alert; ev.type=XDR::EventType::AlertSuspiciousExecRegion; ev.pid=pi.pid; ev.image=pi.image; ev.details=ds.str(); XDR::Storage::Insert(ev); auto* msg=new std::wstring(line); PostMessageW(hwnd,WM_APP+2,(WPARAM)msg,0); EnqueueYara(pi.pid,(uintptr_t)addr,std::min<size_t>(mbi.RegionSize,g_settings.yaraMaxRegionSize),L"susp_exec"); } } } }
@@ -137,15 +180,13 @@ static void EmitPrivDelta(HWND hwnd,const ProcInfo& pi,const std::wstring& newly
 static std::atomic_bool g_bgRun{false}; static std::thread g_bgThread; static void BgLoop(){ while(g_bgRun.load()){ HWND hwnd=g_hwndNotify.load(); if(hwnd) Behavioral::Periodic(hwnd); for(int i=0;i<10 && g_bgRun.load(); ++i) std::this_thread::sleep_for(100ms);} }
 namespace Behavioral { void StartBackground(HWND hwnd){ g_hwndNotify=hwnd; if(g_bgRun.load()) return; g_bgRun=true; g_bgThread=std::thread(BgLoop); if(g_settings.enableYaraRegionScan && !g_yaraRun.load()){ g_yaraRun=true; g_yaraThread=std::thread(YaraLoop);} } void StopBackground(){ g_bgRun=false; if(g_bgThread.joinable()) g_bgThread.join(); g_yaraRun=false; if(g_yaraThread.joinable()) g_yaraThread.join(); } }
 
-// ================= API surface (re-written for brace correctness) =================
+// ================= API surface =================
 namespace Behavioral {
     void AnalyzeProcessMemory(DWORD pid, HWND hwnd){
         HANDLE h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
         if(!h) return;
         wchar_t buf[MAX_PATH]; DWORD sz=MAX_PATH; std::wstring img=L"pid="+std::to_wstring(pid);
-        if(QueryFullProcessImageNameW(h,0,buf,&sz)){
-            std::wstring full=buf; size_t p=full.find_last_of(L'\\'); img = (p==std::wstring::npos)?full:full.substr(p+1);
-        }
+        if(QueryFullProcessImageNameW(h,0,buf,&sz)){ std::wstring full=buf; size_t p=full.find_last_of(L'\\'); img = (p==std::wstring::npos)?full:full.substr(p+1); }
         CloseHandle(h);
         std::wstring det;
         if(MemoryAnalysis::DetectProcessHollowing(pid,det)) EmitGeneric(hwnd,pid,img,XDR::EventType::AlertProcessHollowing,det);
@@ -158,24 +199,13 @@ namespace Behavioral {
     void OnProcessStart(DWORD pid,const std::wstring& image,HWND hwnd){
         ProcInfo pi{pid,image,steady_clock::now()};
         HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid);
-        if(h){
-            pi.integrity=IntegrityLevel(h);
-            pi.lastIntegrityDyn=pi.integrity;
-            pi.seDebug=HasSeDebug(h);
-            pi.adminGroup=IsAdminGroup(h);
-            pi.privSnapshot=GetEnabledPrivs(h);
-            pi.hasDbgHelp=EnumHas(h,L"dbghelp.dll");
-            pi.hasComSvcs=EnumHas(h,L"comsvcs.dll");
-            CloseHandle(h);
-        }
+        if(h){ pi.integrity=IntegrityLevel(h); pi.lastIntegrityDyn=pi.integrity; pi.seDebug=HasSeDebug(h); pi.adminGroup=IsAdminGroup(h); pi.privSnapshot=GetEnabledPrivs(h); pi.hasDbgHelp=EnumHas(h,L"dbghelp.dll"); pi.hasComSvcs=EnumHas(h,L"comsvcs.dll"); CloseHandle(h);} 
         pi.parentPid=ParentPid(pid);
         if(pi.parentPid){ HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION,FALSE,pi.parentPid); if(hp){ pi.parentIntegrity=IntegrityLevel(hp); CloseHandle(hp);} }
         pi.nextRegionScan=steady_clock::now();
         g_procs[pid]=pi;
         auto lw=lower(image);
-        if(lw.find(L"powershell")!=std::wstring::npos || lw.find(L"cmd.exe")!=std::wstring::npos){
-            EmitGeneric(hwnd,pid,image,XDR::EventType::AlertSuspiciousProcess,L"shell_start");
-        }
+        if(lw.find(L"powershell")!=std::wstring::npos || lw.find(L"cmd.exe")!=std::wstring::npos){ EmitGeneric(hwnd,pid,image,XDR::EventType::AlertSuspiciousProcess,L"shell_start"); }
     }
 
     void OnProcessStop(DWORD pid){ g_procs.erase(pid); g_extra.erase(pid); }
@@ -183,55 +213,24 @@ namespace Behavioral {
     void Periodic(HWND hwnd){
         auto now=steady_clock::now();
         if(now - g_lastSweep < seconds(3)){ ScanThreads(hwnd); return; }
-        g_lastSweep=now;
-        ScanLsassHandles();
-        ScanThreads(hwnd);
-        PruneAlerts();
+        g_lastSweep=now; ScanLsassHandles(); ScanThreads(hwnd); PruneAlerts();
+        // New: persistence / registry scans moved to separate compilation unit
+        Behavioral::PersistencePeriodic(hwnd);
         for(auto &kv: g_procs){
-            auto &pi=kv.second; auto alive=duration_cast<seconds>(now - pi.start).count();
-            pi.hasLsass = g_lsassProcs.contains(pi.pid);
+            auto &pi=kv.second; auto alive=duration_cast<seconds>(now - pi.start).count(); pi.hasLsass = g_lsassProcs.contains(pi.pid);
             // Integrity change
             if(alive>=2){ HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION,FALSE,pi.pid); if(h){ auto cur=IntegrityLevel(h); CloseHandle(h); if(cur!=pi.lastIntegrityDyn){ pi.lastIntegrityDyn=cur; if(AlertAllowed(pi.pid,XDR::EventType::AlertPrivilegedExec,0)) EmitPriv(hwnd,pi,L"integrity_change"); } } }
             // Region protection transitions
             bool doScan = g_settings.enableProtTransitions && ((alive<30) || (now>=pi.nextRegionScan));
-            if(doScan){
-                pi.nextRegionScan=now+seconds(10);
-                HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid);
-                if(hp){
-                    MEMORY_BASIC_INFORMATION mbi; unsigned char* addr=nullptr; int rc=0;
-                    while(VirtualQueryEx(hp,addr,&mbi,sizeof(mbi))==sizeof(mbi)){
-                        if(mbi.State==MEM_COMMIT){
-                            DWORD prev=pi.lastProt[(uintptr_t)mbi.BaseAddress];
-                            if(prev && prev!=mbi.Protect){
-                                bool newExec=IsExec(mbi.Protect), newWrite=IsWrite(mbi.Protect);
-                                bool prevWrite=IsWrite(prev); // prevExec unused simplification
-                                if(mbi.RegionSize>=0x400 && newExec && !newWrite && prevWrite && mbi.Type!=MEM_IMAGE){
-                                    if(AlertAllowed(pi.pid,XDR::EventType::AlertReflectiveMemory,(uintptr_t)mbi.BaseAddress)){
-                                        BYTE sample[128]; SIZE_T br=0; ReadProcessMemory(hp,mbi.BaseAddress,sample,sizeof(sample),&br);
-                                        uint64_t h=Fnv1a64(sample,std::min<SIZE_T>(br,64)); double ent=Entropy(sample,std::min<SIZE_T>(br,128));
-                                        std::wstringstream ds; ds<<L"event=prot_transition base=0x"<<std::hex<<(uintptr_t)mbi.BaseAddress<<L" size="<<std::dec<<mbi.RegionSize<<L" oldProt="<<ProtToString(prev)<<L" newProt="<<ProtToString(mbi.Protect)<<L" ent="<<std::fixed<<std::setprecision(2)<<ent<<L" hash=0x"<<std::hex<<h;
-                                        EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertReflectiveMemory,ds.str());
-                                        EnqueueYara(pi.pid,(uintptr_t)mbi.BaseAddress,std::min<size_t>(mbi.RegionSize,g_settings.yaraMaxRegionSize),L"prot_transition");
-                                        AnalyzePERegion(hwnd,pi,hp,(uintptr_t)mbi.BaseAddress,mbi.RegionSize,mbi.Type);
-                                    }
-                                }
-                            }
-                            pi.lastProt[(uintptr_t)mbi.BaseAddress]=mbi.Protect;
-                        }
-                        addr+=mbi.RegionSize; if(++rc>4096) break; if(!addr) break;
-                    }
-                    CloseHandle(hp);
-                }
-            }
+            if(doScan){ pi.nextRegionScan=now+seconds(10); HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(hp){ MEMORY_BASIC_INFORMATION mbi; unsigned char* addr=nullptr; int rc=0; while(VirtualQueryEx(hp,addr,&mbi,sizeof(mbi))==sizeof(mbi)){ if(mbi.State==MEM_COMMIT){ DWORD prev=pi.lastProt[(uintptr_t)mbi.BaseAddress]; if(prev && prev!=mbi.Protect){ bool newExec=IsExec(mbi.Protect), newWrite=IsWrite(mbi.Protect); bool prevWrite=IsWrite(prev); if(mbi.RegionSize>=0x400 && newExec && !newWrite && prevWrite && mbi.Type!=MEM_IMAGE){ if(AlertAllowed(pi.pid,XDR::EventType::AlertReflectiveMemory,(uintptr_t)mbi.BaseAddress)){ BYTE sample[128]; SIZE_T br=0; ReadProcessMemory(hp,mbi.BaseAddress,sample,sizeof(sample),&br); uint64_t h=Fnv1a64(sample,std::min<SIZE_T>(br,64)); double ent=Entropy(sample,std::min<SIZE_T>(br,128)); std::wstringstream ds; ds<<L"event=prot_transition base=0x"<<std::hex<<(uintptr_t)mbi.BaseAddress<<L" size="<<std::dec<<mbi.RegionSize<<L" oldProt="<<ProtToString(prev)<<L" newProt="<<ProtToString(mbi.Protect)<<L" ent="<<std::fixed<<std::setprecision(2)<<ent<<L" hash=0x"<<std::hex<<h; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertReflectiveMemory,ds.str()); EnqueueYara(pi.pid,(uintptr_t)mbi.BaseAddress,std::min<size_t>(mbi.RegionSize,g_settings.yaraMaxRegionSize),L"prot_transition"); AnalyzePERegion(hwnd,pi,hp,(uintptr_t)mbi.BaseAddress,mbi.RegionSize,mbi.Type); } } } pi.lastProt[(uintptr_t)mbi.BaseAddress]=mbi.Protect; } addr+=mbi.RegionSize; if(++rc>4096) break; if(!addr) break; } CloseHandle(hp);} }
             // Initial module & unsigned
             if(!pi.checkedModules && alive<=30){ HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(h){ pi.hasDbgHelp=EnumHas(h,L"dbghelp.dll")||pi.hasDbgHelp; pi.hasComSvcs=EnumHas(h,L"comsvcs.dll")||pi.hasComSvcs; CloseHandle(h);} CheckUnsignedModules(hwnd,pi); pi.checkedModules=true; }
             // Priv escalation baseline
             if(!pi.privAlerted && alive>=2){ bool elevated=(pi.integrity==L"High"||pi.integrity==L"System"); bool parentMismatch=elevated && !pi.parentIntegrity.empty() && (pi.parentIntegrity!=L"High" && pi.parentIntegrity!=L"System"); bool heur=pi.hasLsass || (elevated && pi.seDebug); if(elevated && (parentMismatch||heur)){ EmitPriv(hwnd,pi,parentMismatch?L"parent_mismatch":L"privileged"); pi.privAlerted=true; } }
             if(!pi.followPriv && alive>=5 && alive<=600){ HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION,FALSE,pi.pid); if(h){ auto nowPriv=GetEnabledPrivs(h); CloseHandle(h); std::wstring newly; for(auto &p:nowPriv){ if(!pi.privSnapshot.contains(p) && kHighRiskPrivs.contains(p)){ if(!newly.empty()) newly+=L";"; newly+=p; } } if(!newly.empty()){ EmitPrivDelta(hwnd,pi,newly); pi.followPriv=true; } } }
-            if(!pi.injAlerted && alive>=2 && alive<=180){ if(g_settings.enableInjectionHeuristic){ auto res=ScanForInjectionVerbose(pi.pid); if(res.suspicious && AlertAllowed(pi.pid,XDR::EventType::AlertProcessInjection,0)){ pi.injAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertProcessInjection,std::format(L"sample={} priv_exec={} wexec={}",res.sample,res.privateExecRegions,res.writableExecRegions)); } } }
+            if(!pi.injAlerted && alive>=2 && alive<=180){ if(g_settings.enableInjectionHeuristic){ auto res=ScanForInjectionVerbose(pi.pid); if(res.suspicious && AlertAllowed(pi.pid,XDR::EventType::AlertProcessInjection,0)){ pi.injAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertProcessInjection,std::format(L"sample={} private_exec_regions={} writable_exec_regions={}",res.sample,res.privateExecRegions,res.writableExecRegions)); } } }
             if(!pi.hollowAlerted && alive>=3 && alive<=300){ std::wstring det; if(MemoryAnalysis::DetectProcessHollowing(pi.pid,det) && AlertAllowed(pi.pid,XDR::EventType::AlertProcessHollowing,0)){ pi.hollowAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertProcessHollowing,det); } }
             if(!pi.reflMemAlerted && alive>=3 && alive<=300){ std::wstring det; if(MemoryAnalysis::DetectReflectiveLoading(pi.pid,det) && AlertAllowed(pi.pid,XDR::EventType::AlertReflectiveMemory,0)){ pi.reflMemAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertReflectiveMemory,det); } }
-            // Enhancements
             CheckApiHooks(hwnd,pi);
             ClassifyExecRegions(hwnd,pi);
         }

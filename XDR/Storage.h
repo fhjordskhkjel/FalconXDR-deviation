@@ -28,7 +28,12 @@ namespace XDR
         // New types
         AlertUnsignedModule,          // unsigned / untrusted module load
         AlertSuspiciousExecRegion,    // anomalous executable private region
-        AlertApiHook                  // API hooking / prologue tamper
+        AlertApiHook,                 // API hooking / prologue tamper
+        // Persistence / registry monitoring
+        AlertAutorunChange,           // change in autorun (Run / RunOnce) entries
+        AlertServicePersistence,      // new or modified service entry
+        AlertPolicyModification,      // security / system policy registry value change
+        AlertRegistryPersistence      // generic registry-based persistence artifact
     };
 
     struct Event

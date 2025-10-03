@@ -16,6 +16,10 @@ namespace Behavioral {
         bool enableApiHookScan = true;              // toggle API hook heuristic
         bool enableExecRegionClassifier = true;     // toggle entropy/density exec region classifier
         bool enableInjectionHeuristic = true;       // toggle legacy injection heuristic scan
+        // Persistence / registry
+        bool enableAutorunScan = true;              // monitor autorun keys
+        bool enableServiceScan = true;              // monitor new/modified services
+        bool enablePolicyScan = true;               // monitor security / system policy changes
     };
     // set/get global settings
     void SetSettings(const Settings& s);

@@ -133,6 +133,7 @@
     <ClInclude Include="Logger.h" />
     <ClInclude Include="MemoryAnalysis.h" />
     <ClInclude Include="NetworkMonitor.h" />
+    <ClInclude Include="PersistenceMonitor.h" />
     <ClInclude Include="ProcessMonitor.h" />
     <ClInclude Include="QueryDialog.h" />
     <ClInclude Include="Resource.h" />
@@ -150,6 +151,7 @@
     <ClCompile Include="Logger.cpp" />
     <ClCompile Include="MemoryAnalysis.cpp" />
     <ClCompile Include="NetworkMonitor.cpp" />
+    <ClCompile Include="PersistenceMonitor.cpp" />
     <ClCompile Include="ProcessMonitor.cpp" />
     <ClCompile Include="QueryDialog.cpp" />
     <ClCompile Include="ScreenshotMonitor.cpp" />

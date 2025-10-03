@@ -66,7 +66,7 @@ namespace MemoryAnalysis {
                 region.isMapped = (mbi.Type == MEM_MAPPED);
                 region.isPrivate = (mbi.Type == MEM_PRIVATE);
                 region.isPEHeader = IsPEHeader(mbi.BaseAddress, mbi.RegionSize, hProcess);
-                region.isSuspicious = region.isExecutable && !region.isMapped && region.isPEHeader;
+                region.isSuspicious = region.isExecutable && region.isPEHeader && (region.isPrivate || region.isMapped);
                 
                 regions.push_back(region);
             }
