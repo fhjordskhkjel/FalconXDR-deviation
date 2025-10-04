@@ -4,6 +4,7 @@
 #include "MemoryAnalysis.h"
 #include "YaraSupport.h"
 #include "PersistenceMonitor.h" // added
+#include "ShellcodeDetection.h" // added
 
 #include <windows.h>
 #include <psapi.h>
@@ -32,6 +33,9 @@
 
 using namespace std::chrono;
 
+// Forward declaration needed by early scanners
+static void EmitGeneric(HWND hwnd,DWORD pid,const std::wstring& img,XDR::EventType t,const std::wstring& det);
+
 // ================= Settings =================
 static Behavioral::Settings g_settings; // runtime configurable
 namespace Behavioral { void SetSettings(const Settings& s){ g_settings=s; } Settings GetSettings(){ return g_settings; } }
@@ -49,13 +53,28 @@ namespace Behavioral { void SetSettings(const Settings& s){ g_settings=s; } Sett
 #ifndef ThreadQuerySetWin32StartAddress
 #define ThreadQuerySetWin32StartAddress 9
 #endif
+// Partial memory information class for NtQueryVirtualMemory
+#ifndef MemorySectionName
+#define MemorySectionName 2
+#endif
+#ifndef MemoryBasicInformation
+#define MemoryBasicInformation 0
+#endif
+
 #pragma pack(push,1)
 struct SYSTEM_HANDLE_ENTRY { ULONG ProcessId; UCHAR ObjectTypeNumber; UCHAR Flags; USHORT Handle; PVOID Object; ACCESS_MASK GrantedAccess; };
 struct SYSTEM_HANDLE_INFORMATION_WRAPPER { ULONG HandleCount; SYSTEM_HANDLE_ENTRY Handles[1]; };
 #pragma pack(pop)
 using NtQuerySystemInformation_t = NTSTATUS (NTAPI*)(ULONG,PVOID,ULONG,PULONG);
 using NtQueryInformationThread_t = NTSTATUS (NTAPI*)(HANDLE,ULONG,PVOID,ULONG,PULONG);
-static NtQuerySystemInformation_t pNtQuerySystemInformation=nullptr; static NtQueryInformationThread_t pNtQueryInformationThread=nullptr;
+using NtQueryVirtualMemory_t = NTSTATUS (NTAPI*)(HANDLE,PVOID,ULONG,PVOID,SIZE_T,PSIZE_T);
+static NtQuerySystemInformation_t pNtQuerySystemInformation=nullptr; static NtQueryInformationThread_t pNtQueryInformationThread=nullptr; static NtQueryVirtualMemory_t pNtQueryVirtualMemory=nullptr;
+
+// Helper struct for MemorySectionName result (undocumented)
+typedef struct _MEMORY_SECTION_NAME {
+    UNICODE_STRING SectionFileName; // Buffer points to Name[] within the same allocation
+    WCHAR Name[1];
+} MEMORY_SECTION_NAME, *PMEMORY_SECTION_NAME;
 
 // ================= Helpers =================
 static std::wstring lower(std::wstring s){ for(auto &c:s) c=(wchar_t)towlower(c); return s; }
@@ -68,11 +87,26 @@ static bool IsExec(DWORD p){ return p & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXE
 static bool IsExecWrite(DWORD p){ return IsExec(p) && IsWrite(p); }
 static std::wstring ProtToString(DWORD p){ switch(p){ case PAGE_EXECUTE: return L"X"; case PAGE_EXECUTE_READ: return L"RX"; case PAGE_EXECUTE_READWRITE: return L"RWX"; case PAGE_EXECUTE_WRITECOPY: return L"WCX"; case PAGE_READONLY: return L"R"; case PAGE_READWRITE: return L"RW"; case PAGE_WRITECOPY: return L"WC"; case PAGE_NOACCESS: return L"NA"; default: return L"?"; } }
 
+static std::wstring MappedNameForAddress(HANDLE hp, LPCVOID addr){
+    // Try NtQueryVirtualMemory(MemorySectionName)
+    if(!pNtQueryVirtualMemory){ HMODULE ntdll=GetModuleHandleW(L"ntdll.dll"); if(ntdll) pNtQueryVirtualMemory=(NtQueryVirtualMemory_t)GetProcAddress(ntdll,"NtQueryVirtualMemory"); }
+    if(pNtQueryVirtualMemory){ SIZE_T need=0; NTSTATUS st=pNtQueryVirtualMemory(hp,(PVOID)addr,MemorySectionName,nullptr,0,&need); if(st==STATUS_INFO_LENGTH_MISMATCH && need){ std::vector<BYTE> buf(need+sizeof(WCHAR)); st=pNtQueryVirtualMemory(hp,(PVOID)addr,MemorySectionName,buf.data(),buf.size(),&need); if(NT_SUCCESS(st)){ auto msn=reinterpret_cast<PMEMORY_SECTION_NAME>(buf.data()); if(msn->SectionFileName.Buffer && msn->SectionFileName.Length){ return std::wstring(msn->SectionFileName.Buffer, msn->SectionFileName.Length/sizeof(WCHAR)); } } } }
+    // Fallback to GetMappedFileNameW
+    wchar_t path[MAX_PATH]; if(GetMappedFileNameW(hp,(LPVOID)addr,path,MAX_PATH)) return std::wstring(path);
+    return L"";
+}
+
 // ================= Alert rate limiting =================
 struct AlertKey { DWORD pid; XDR::EventType type; uintptr_t base; bool operator==(const AlertKey&o)const noexcept{ return pid==o.pid && type==o.type && base==o.base; } }; struct AlertKeyHash { size_t operator()(const AlertKey&k)const noexcept{ size_t h=std::hash<DWORD>{}(k.pid); h^=(size_t)k.type+0x9e37+(h<<6)+(h>>2); h^=std::hash<uintptr_t>{}(k.base)+0x9e37+(h<<6)+(h>>2); return h;} }; static std::unordered_map<AlertKey,steady_clock::time_point,AlertKeyHash> g_alertCache; static const auto kAlertTTL=seconds(30); static bool AlertAllowed(DWORD pid,XDR::EventType t,uintptr_t base){ auto now=steady_clock::now(); AlertKey k{pid,t,base}; auto it=g_alertCache.find(k); if(it!=g_alertCache.end()){ if(now-it->second<kAlertTTL) return false; it->second=now; return true;} g_alertCache.emplace(k,now); return true;} static void PruneAlerts(){ auto now=steady_clock::now(); for(auto it=g_alertCache.begin(); it!=g_alertCache.end();){ if(now-it->second>kAlertTTL) it=g_alertCache.erase(it); else ++it; } }
 
+// ================= Helpers (token) =================
+static std::wstring SidToString(PSID sid){ LPWSTR s=nullptr; if(ConvertSidToStringSidW(sid,&s)){ std::wstring out=s; LocalFree(s); return out; } return L""; }
+static std::wstring ProcessUserSidString(HANDLE hProcess){ HANDLE tok{}; if(!OpenProcessToken(hProcess,TOKEN_QUERY,&tok)) return L""; DWORD len=0; GetTokenInformation(tok,TokenUser,nullptr,0,&len); std::wstring out; if(GetLastError()==ERROR_INSUFFICIENT_BUFFER){ auto buf=std::unique_ptr<BYTE[]>(new BYTE[len]); if(GetTokenInformation(tok,TokenUser,buf.get(),len,&len)){ auto tu=reinterpret_cast<TOKEN_USER*>(buf.get()); out=SidToString(tu->User.Sid); } } CloseHandle(tok); return out; }
+static std::wstring ThreadUserSidString(HANDLE hThread){ HANDLE tok{}; if(!OpenThreadToken(hThread,TOKEN_QUERY,TRUE,&tok)) return L""; DWORD len=0; GetTokenInformation(tok,TokenUser,nullptr,0,&len); std::wstring out; if(GetLastError()==ERROR_INSUFFICIENT_BUFFER){ auto buf=std::unique_ptr<BYTE[]>(new BYTE[len]); if(GetTokenInformation(tok,TokenUser,buf.get(),len,&len)){ auto tu=reinterpret_cast<TOKEN_USER*>(buf.get()); out=SidToString(tu->User.Sid); } } CloseHandle(tok); return out; }
+static bool ThreadImpersonationLevel(HANDLE hThread, SECURITY_IMPERSONATION_LEVEL& level){ HANDLE tok{}; if(!OpenThreadToken(hThread,TOKEN_QUERY,TRUE,&tok)) return false; DWORD len=0; level=SecurityAnonymous; BOOL ok=GetTokenInformation(tok,TokenImpersonationLevel,&level,sizeof(level),&len); CloseHandle(tok); return ok==TRUE; }
+
 // ================= Process tracking =================
-struct ProcInfo { DWORD pid; std::wstring image; steady_clock::time_point start; DWORD parentPid{}; std::wstring integrity; std::wstring parentIntegrity; bool seDebug=false; bool adminGroup=false; bool privAlerted=false; bool followPriv=false; bool injAlerted=false; bool hollowAlerted=false; bool reflMemAlerted=false; bool checkedModules=false; bool hasDbgHelp=false; bool hasComSvcs=false; bool hasLsass=false; std::wstring lastIntegrityDyn; std::set<std::wstring> privSnapshot; std::unordered_map<uintptr_t,DWORD> lastProt; std::unordered_set<DWORD> knownThreads; std::vector<std::pair<uintptr_t,uintptr_t>> moduleRanges; steady_clock::time_point lastModEnum{}; steady_clock::time_point nextRegionScan{}; };
+struct ProcInfo { DWORD pid; std::wstring image; steady_clock::time_point start; DWORD parentPid{}; std::wstring integrity; std::wstring parentIntegrity; bool seDebug=false; bool adminGroup=false; bool privAlerted=false; bool followPriv=false; bool injAlerted=false; bool hollowAlerted=false; bool reflMemAlerted=false; bool checkedModules=false; bool hasDbgHelp=false; bool hasComSvcs=false; bool hasLsass=false; std::wstring lastIntegrityDyn; std::set<std::wstring> privSnapshot; std::unordered_map<uintptr_t,DWORD> lastProt; std::unordered_set<DWORD> knownThreads; std::vector<std::pair<uintptr_t,uintptr_t>> moduleRanges; steady_clock::time_point lastModEnum{}; steady_clock::time_point nextRegionScan{}; std::wstring userSid; std::unordered_set<DWORD> alertedImpersonatingThreads; };
 struct ProcExtra { std::unordered_set<std::wstring> unsignedMods; bool apiHooksChecked=false; std::unordered_set<uint64_t> suspiciousExecHashes; };
 static std::unordered_map<DWORD,ProcInfo> g_procs; static std::unordered_map<DWORD,ProcExtra> g_extra; static steady_clock::time_point g_lastSweep{steady_clock::now()};
 
@@ -171,6 +205,14 @@ static steady_clock::time_point g_lastThreadScan{}; static const auto kThreadSca
     }while(Thread32Next(snap,&te)); CloseHandle(snap);
 }
 
+// ================= Token impersonation scan =================
+static steady_clock::time_point g_lastTokScan{}; static const auto kTokScanInterval=seconds(5);
+static void ScanTokenImpersonation(HWND hwnd){ auto now=steady_clock::now(); if(now - g_lastTokScan < kTokScanInterval) return; g_lastTokScan=now; HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0); if(snap==INVALID_HANDLE_VALUE) return; THREADENTRY32 te{sizeof(te)}; if(!Thread32First(snap,&te)){ CloseHandle(snap); return; }
+    do{ auto it=g_procs.find(te.th32OwnerProcessID); if(it==g_procs.end()) continue; auto &pi=it->second; HANDLE th=OpenThread(THREAD_QUERY_INFORMATION,FALSE,te.th32ThreadID); if(!th) continue; SECURITY_IMPERSONATION_LEVEL lvl{}; if(ThreadImpersonationLevel(th,lvl)){ if(lvl==SecurityImpersonation || lvl==SecurityDelegation){ std::wstring tSid=ThreadUserSidString(th); if(!tSid.empty() && tSid!=pi.userSid){ if(pi.alertedImpersonatingThreads.insert(te.th32ThreadID).second && AlertAllowed(pi.pid,XDR::EventType::AlertTokenManipulation,te.th32ThreadID)){ std::wstringstream ds; ds<<L"event=token_impersonation tid="<<te.th32ThreadID<<L" level="<<(int)lvl<<L" threadSid="<<tSid<<L" procSid="<<pi.userSid; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertTokenManipulation,ds.str()); } } } }
+        CloseHandle(th);
+    } while(Thread32Next(snap,&te)); CloseHandle(snap);
+}
+
 // ================= Emitters =================
 static void EmitGeneric(HWND hwnd,DWORD pid,const std::wstring& img,XDR::EventType t,const std::wstring& det){ auto ep=(long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(); auto line=std::format(L"[{}] ALERT {} pid={} name={} {}",ep,(int)t,pid,img,det); Logger::Write(line); XDR::Event ev; ev.category=XDR::EventCategory::Alert; ev.type=t; ev.pid=pid; ev.image=img; ev.details=det; XDR::Storage::Insert(ev); auto* p=new std::wstring(line); PostMessageW(hwnd,WM_APP+2,(WPARAM)p,0); }
 static void EmitPriv(HWND hwnd,const ProcInfo& pi,const std::wstring& reason){ EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertPrivilegedExec,std::format(L"reason={} integrity={} parent_integrity={} parent={} seDebug={} lsass_handle={}",reason,pi.integrity,pi.parentIntegrity,pi.parentPid,pi.seDebug?1:0,pi.hasLsass?1:0)); }
@@ -199,7 +241,7 @@ namespace Behavioral {
     void OnProcessStart(DWORD pid,const std::wstring& image,HWND hwnd){
         ProcInfo pi{pid,image,steady_clock::now()};
         HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid);
-        if(h){ pi.integrity=IntegrityLevel(h); pi.lastIntegrityDyn=pi.integrity; pi.seDebug=HasSeDebug(h); pi.adminGroup=IsAdminGroup(h); pi.privSnapshot=GetEnabledPrivs(h); pi.hasDbgHelp=EnumHas(h,L"dbghelp.dll"); pi.hasComSvcs=EnumHas(h,L"comsvcs.dll"); CloseHandle(h);} 
+        if(h){ pi.integrity=IntegrityLevel(h); pi.lastIntegrityDyn=pi.integrity; pi.seDebug=HasSeDebug(h); pi.adminGroup=IsAdminGroup(h); pi.privSnapshot=GetEnabledPrivs(h); pi.hasDbgHelp=EnumHas(h,L"dbghelp.dll"); pi.hasComSvcs=EnumHas(h,L"comsvcs.dll"); pi.userSid=ProcessUserSidString(h); CloseHandle(h);} 
         pi.parentPid=ParentPid(pid);
         if(pi.parentPid){ HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION,FALSE,pi.parentPid); if(hp){ pi.parentIntegrity=IntegrityLevel(hp); CloseHandle(hp);} }
         pi.nextRegionScan=steady_clock::now();
@@ -214,15 +256,46 @@ namespace Behavioral {
         auto now=steady_clock::now();
         if(now - g_lastSweep < seconds(3)){ ScanThreads(hwnd); return; }
         g_lastSweep=now; ScanLsassHandles(); ScanThreads(hwnd); PruneAlerts();
-        // New: persistence / registry scans moved to separate compilation unit
         Behavioral::PersistencePeriodic(hwnd);
+        ScanTokenImpersonation(hwnd);
         for(auto &kv: g_procs){
             auto &pi=kv.second; auto alive=duration_cast<seconds>(now - pi.start).count(); pi.hasLsass = g_lsassProcs.contains(pi.pid);
             // Integrity change
             if(alive>=2){ HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION,FALSE,pi.pid); if(h){ auto cur=IntegrityLevel(h); CloseHandle(h); if(cur!=pi.lastIntegrityDyn){ pi.lastIntegrityDyn=cur; if(AlertAllowed(pi.pid,XDR::EventType::AlertPrivilegedExec,0)) EmitPriv(hwnd,pi,L"integrity_change"); } } }
             // Region protection transitions
             bool doScan = g_settings.enableProtTransitions && ((alive<30) || (now>=pi.nextRegionScan));
-            if(doScan){ pi.nextRegionScan=now+seconds(10); HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(hp){ MEMORY_BASIC_INFORMATION mbi; unsigned char* addr=nullptr; int rc=0; while(VirtualQueryEx(hp,addr,&mbi,sizeof(mbi))==sizeof(mbi)){ if(mbi.State==MEM_COMMIT){ DWORD prev=pi.lastProt[(uintptr_t)mbi.BaseAddress]; if(prev && prev!=mbi.Protect){ bool newExec=IsExec(mbi.Protect), newWrite=IsWrite(mbi.Protect); bool prevWrite=IsWrite(prev); if(mbi.RegionSize>=0x400 && newExec && !newWrite && prevWrite && mbi.Type!=MEM_IMAGE){ if(AlertAllowed(pi.pid,XDR::EventType::AlertReflectiveMemory,(uintptr_t)mbi.BaseAddress)){ BYTE sample[128]; SIZE_T br=0; ReadProcessMemory(hp,mbi.BaseAddress,sample,sizeof(sample),&br); uint64_t h=Fnv1a64(sample,std::min<SIZE_T>(br,64)); double ent=Entropy(sample,std::min<SIZE_T>(br,128)); std::wstringstream ds; ds<<L"event=prot_transition base=0x"<<std::hex<<(uintptr_t)mbi.BaseAddress<<L" size="<<std::dec<<mbi.RegionSize<<L" oldProt="<<ProtToString(prev)<<L" newProt="<<ProtToString(mbi.Protect)<<L" ent="<<std::fixed<<std::setprecision(2)<<ent<<L" hash=0x"<<std::hex<<h; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertReflectiveMemory,ds.str()); EnqueueYara(pi.pid,(uintptr_t)mbi.BaseAddress,std::min<size_t>(mbi.RegionSize,g_settings.yaraMaxRegionSize),L"prot_transition"); AnalyzePERegion(hwnd,pi,hp,(uintptr_t)mbi.BaseAddress,mbi.RegionSize,mbi.Type); } } } pi.lastProt[(uintptr_t)mbi.BaseAddress]=mbi.Protect; } addr+=mbi.RegionSize; if(++rc>4096) break; if(!addr) break; } CloseHandle(hp);} }
+            if(doScan){ pi.nextRegionScan=now+seconds(10); HANDLE hp=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(hp){ MEMORY_BASIC_INFORMATION mbi; unsigned char* addr=nullptr; int rc=0; while(VirtualQueryEx(hp,addr,&mbi,sizeof(mbi))==sizeof(mbi)){ if(mbi.State==MEM_COMMIT){ DWORD prev=pi.lastProt[(uintptr_t)mbi.BaseAddress];
+                        // Newly observed region: emit origin details
+                        if(prev==0){
+                            XDR::Event ev; ev.category=XDR::EventCategory::Process; ev.type=XDR::EventType::MemRegionOrigin; ev.pid=pi.pid; ev.image=pi.image;
+                            std::wstring mapped = MappedNameForAddress(hp, mbi.BaseAddress);
+                            std::wstringstream ds; ds<<L"event=mem_region_origin base=0x"<<std::hex<<(uintptr_t)mbi.BaseAddress
+                                <<L" size="<<std::dec<<mbi.RegionSize
+                                <<L" type="<<(mbi.Type==MEM_IMAGE?L"Image":(mbi.Type==MEM_PRIVATE?L"Private":L"Mapped"))
+                                <<L" allocBase=0x"<<std::hex<<(uintptr_t)mbi.AllocationBase
+                                <<L" allocProt="<<ProtToString(mbi.AllocationProtect)
+                                <<L" prot="<<ProtToString(mbi.Protect);
+                            if(!mapped.empty()) ds<<L" file="<<mapped;
+                            ev.details=ds.str(); XDR::Storage::Insert(ev);
+                            Logger::Write(std::format(L"[{}] EVT MemRegionOrigin pid={} name={} {}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), pi.pid, pi.image, ev.details));
+                        }
+                        if(prev && prev!=mbi.Protect){
+                        // Emit timeline telemetry for any protection change
+                        {
+                            XDR::Event ev; ev.category=XDR::EventCategory::Process; ev.type=XDR::EventType::MemProtChange; ev.pid=pi.pid; ev.image=pi.image; 
+                            std::wstring mapped = MappedNameForAddress(hp, mbi.BaseAddress);
+                            std::wstringstream ds; ds<<L"event=mem_prot_change base=0x"<<std::hex<<(uintptr_t)mbi.BaseAddress
+                               <<L" size="<<std::dec<<mbi.RegionSize
+                               <<L" oldProt="<<ProtToString(prev)
+                               <<L" newProt="<<ProtToString(mbi.Protect)
+                               <<L" type="<<(mbi.Type==MEM_IMAGE?L"Image":(mbi.Type==MEM_PRIVATE?L"Private":L"Mapped"));
+                            if(!mapped.empty()) ds<<L" file="<<mapped;
+                            ev.details=ds.str(); XDR::Storage::Insert(ev);
+                            Logger::Write(std::format(L"[{}] EVT MemProtChange pid={} name={} {}", (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(), pi.pid, pi.image, ev.details));
+                        }
+                        bool newExec=IsExec(mbi.Protect), newWrite=IsWrite(mbi.Protect); bool prevWrite=IsWrite(prev); if(mbi.RegionSize>=0x400 && newExec && !newWrite && prevWrite && mbi.Type!=MEM_IMAGE){ if(AlertAllowed(pi.pid,XDR::EventType::AlertReflectiveMemory,(uintptr_t)mbi.BaseAddress)){ BYTE sample[1024]; SIZE_T br=0; ReadProcessMemory(hp,mbi.BaseAddress,sample,sizeof(sample),&br); uint64_t h=Fnv1a64(sample,std::min<SIZE_T>(br,64)); double ent=Entropy(sample,std::min<SIZE_T>(br,128)); auto ind = ShellcodeDetection::Analyze(sample, (size_t)br); std::wstringstream ds; ds<<L"event=prot_transition base=0x"<<std::hex<<(uintptr_t)mbi.BaseAddress<<L" size="<<std::dec<<mbi.RegionSize<<L" oldProt="<<ProtToString(prev)<<L" newProt="<<ProtToString(mbi.Protect)<<L" ent="<<std::fixed<<std::setprecision(2)<<ent<<L" hash=0x"<<std::hex<<h<<L" indicators="<<ShellcodeDetection::ToDetails(ind); EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertReflectiveMemory,ds.str()); std::wstring yaraCtx=L"prot_transition"; yaraCtx+=L" "; yaraCtx+=ShellcodeDetection::ToDetails(ind); EnqueueYara(pi.pid,(uintptr_t)mbi.BaseAddress,std::min<size_t>(mbi.RegionSize,g_settings.yaraMaxRegionSize),yaraCtx); AnalyzePERegion(hwnd,pi,hp,(uintptr_t)mbi.BaseAddress,mbi.RegionSize,mbi.Type); } } }
+                        pi.lastProt[(uintptr_t)mbi.BaseAddress]=mbi.Protect; }
+                        addr+=mbi.RegionSize; if(++rc>4096) break; if(!addr) break; } CloseHandle(hp);} }
             // Initial module & unsigned
             if(!pi.checkedModules && alive<=30){ HANDLE h=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,FALSE,pi.pid); if(h){ pi.hasDbgHelp=EnumHas(h,L"dbghelp.dll")||pi.hasDbgHelp; pi.hasComSvcs=EnumHas(h,L"comsvcs.dll")||pi.hasComSvcs; CloseHandle(h);} CheckUnsignedModules(hwnd,pi); pi.checkedModules=true; }
             // Priv escalation baseline

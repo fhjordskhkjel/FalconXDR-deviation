@@ -29,11 +29,23 @@ namespace XDR
         AlertUnsignedModule,          // unsigned / untrusted module load
         AlertSuspiciousExecRegion,    // anomalous executable private region
         AlertApiHook,                 // API hooking / prologue tamper
+        AlertTokenManipulation,       // token steal/impersonation detected
+        AlertCorrelation,             // correlated attack pattern detection
+        // Network advanced detections
+        AlertBeaconing,               // periodic beacons
+        AlertDNSTunneling,            // suspected DNS tunneling activity
+        AlertUnusualProtocol,         // uncommon protocol/port use
+        AlertTorI2P,                  // Tor/I2P indicators
+        AlertFastFluxDNS,             // fast-flux like pattern
+        AlertKnownC2,                 // matched threat intel C2
         // Persistence / registry monitoring
         AlertAutorunChange,           // change in autorun (Run / RunOnce) entries
         AlertServicePersistence,      // new or modified service entry
         AlertPolicyModification,      // security / system policy registry value change
-        AlertRegistryPersistence      // generic registry-based persistence artifact
+        AlertRegistryPersistence,     // generic registry-based persistence artifact
+        // Process telemetry
+        MemProtChange,                // memory protection change (timeline telemetry)
+        MemRegionOrigin               // initial origin for a newly observed region
     };
 
     struct Event

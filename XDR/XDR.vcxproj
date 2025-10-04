@@ -128,6 +128,7 @@
   <ItemGroup>
     <ClInclude Include="BehavioralAnalyzer.h" />
     <ClInclude Include="Config.h" />
+    <ClInclude Include="CorrelationEngine.h" />
     <ClInclude Include="DriverManager.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="Logger.h" />
@@ -139,6 +140,7 @@
     <ClInclude Include="Resource.h" />
     <ClInclude Include="ScreenshotMonitor.h" />
     <ClInclude Include="SettingsManager.h" />
+    <ClInclude Include="ShellcodeDetection.h" />
     <ClInclude Include="Storage.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="Utilities.h" />
@@ -148,6 +150,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="BehavioralAnalyzer.cpp" />
+    <ClCompile Include="CorrelationEngine.cpp" />
     <ClCompile Include="Logger.cpp" />
     <ClCompile Include="MemoryAnalysis.cpp" />
     <ClCompile Include="NetworkMonitor.cpp" />
@@ -156,6 +159,7 @@
     <ClCompile Include="QueryDialog.cpp" />
     <ClCompile Include="ScreenshotMonitor.cpp" />
     <ClCompile Include="SettingsManager.cpp" />
+    <ClCompile Include="ShellcodeDetection.cpp" />
     <ClCompile Include="Storage.cpp" />
     <ClCompile Include="Utilities.cpp" />
     <ClCompile Include="XDR.cpp" />
