@@ -45,7 +45,13 @@ namespace XDR
         AlertRegistryPersistence,     // generic registry-based persistence artifact
         // Process telemetry
         MemProtChange,                // memory protection change (timeline telemetry)
-        MemRegionOrigin               // initial origin for a newly observed region
+        MemRegionOrigin,              // initial origin for a newly observed region
+        // Credential-access detections
+        AlertLsassAccess,             // process accessed/queried LSASS
+        AlertSamHiveAccess,           // access to SAM/SECURITY registry hives
+        AlertCredentialEnumeration,   // vault/credential manager enumeration
+        AlertDPAPIAbuse,              // DPAPI decryption usage (CryptUnprotectData)
+        AlertKerberosExtraction       // Kerberos ticket extraction/roasting
     };
 
     struct Event
