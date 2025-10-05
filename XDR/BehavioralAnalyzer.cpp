@@ -5,6 +5,7 @@
 #include "YaraSupport.h"
 #include "PersistenceMonitor.h"
 #include "ShellcodeDetection.h"
+#include "CodeCaveDetection.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -310,6 +311,9 @@ struct ProcInfo {
     bool dpapiAlerted=false; 
     bool krbAlerted=false; 
     ProcessRiskProfile::Risk riskLevel{ProcessRiskProfile::Risk::Low}; 
+    steady_clock::time_point nextCodeCaveScan{};
+    int codeCaveScanRuns=0;
+    std::unordered_set<uintptr_t> alertedCodeCaves;
 };
 
 struct ProcExtra { 
@@ -667,6 +671,39 @@ static void EmitGeneric(HWND hwnd,DWORD pid,const std::wstring& img,XDR::EventTy
 static void EmitPriv(HWND hwnd,const ProcInfo& pi,const std::wstring& reason){ EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertPrivilegedExec,std::format(L"reason={} integrity={} parent_integrity={} parent={} seDebug={} lsass_handle={}",reason,pi.integrity,pi.parentIntegrity,pi.parentPid,pi.seDebug?1:0,pi.hasLsass?1:0)); }
 static void EmitPrivDelta(HWND hwnd,const ProcInfo& pi,const std::wstring& newly){ EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertPrivilegedExec,std::format(L"reason=new_priv new_privs={}",newly)); }
 
+static void EmitCodeCaveAlert(HWND hwnd, DWORD pid, const std::wstring& image, const CodeCaveDetection::CodeCave& cave) {
+    std::wstringstream ds;
+    ds << L"event=code_cave location=0x" << std::hex << cave.location
+       << L" size=" << std::dec << cave.size
+       << L" reason=" << cave.detectionReason
+       << L" module=" << cave.moduleContext;
+    
+    if (cave.isHooked) {
+        ds << L" hooked=1 original_bytes=";
+        for (size_t i = 0; i < std::min<size_t>(cave.size, 16); i++) {
+            if (i > 0) ds << L" ";
+            ds << std::hex << std::uppercase << std::setw(2) << std::setfill(L'0') << (int)cave.originalBytes[i];
+        }
+    }
+    
+    auto line = std::format(L"[{}] ALERT CodeCave pid={} name={} {}",
+        (long long)duration_cast<seconds>(system_clock::now().time_since_epoch()).count(),
+        pid, image, ds.str());
+    
+    Logger::Write(line);
+    
+    XDR::Event ev;
+    ev.category = XDR::EventCategory::Alert;
+    ev.type = XDR::EventType::AlertApiHook;
+    ev.pid = pid;
+    ev.image = image;
+    ev.details = ds.str();
+    XDR::Storage::Insert(ev);
+    
+    auto* msg = new std::wstring(line);
+    PostMessageW(hwnd, WM_APP + 2, (WPARAM)msg, 0);
+}
+
 // ================= API surface =================
 namespace Behavioral {
     void AnalyzeProcessMemory(DWORD pid, HWND hwnd){
@@ -699,6 +736,8 @@ namespace Behavioral {
         pi.nextInjHeur = now + seconds(d2);
         pi.nextReflCheck = now + seconds(d3);
         pi.nextHollowCheck = now + seconds(d4);
+        int d5 = g_settings.codeCaveCheckIntervalSec/2; if(d5<5) d5=5;
+        pi.nextCodeCaveScan = now + seconds(d5);
         g_procs[pid]=pi;
         auto lw=lower(image);
         if(lw.find(L"powershell")!=std::wstring::npos || lw.find(L"cmd.exe")!=std::wstring::npos){ EmitGeneric(hwnd,pid,image,XDR::EventType::AlertSuspiciousProcess,L"shell_start"); }
@@ -759,7 +798,11 @@ namespace Behavioral {
             if(!pi.injAlerted && alive>=2 && alive<=180 && now>=pi.nextInjHeur && pi.injHeurRuns<g_settings.injHeurMaxRuns){ if(g_settings.enableInjectionHeuristic){ pi.nextInjHeur = now + seconds(g_settings.injHeurIntervalSec); ++pi.injHeurRuns; auto res=ScanForInjectionVerbose(pi.pid); if(res.suspicious && AlertAllowed(pi.pid,XDR::EventType::AlertProcessInjection,0)){ pi.injAlerted=true; std::wstringstream dss; dss<<L"sample="<<res.sample<<L" private_exec_regions="<<res.privateExecRegions<<L" writable_exec_regions="<<res.writableExecRegions; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertProcessInjection,dss.str()); } } }
             if(!pi.hollowAlerted && alive>=3 && alive<=300 && now>=pi.nextHollowCheck && pi.hollowRuns<g_settings.hollowCheckMaxRuns){ std::wstring det; pi.nextHollowCheck = now + seconds(g_settings.hollowCheckIntervalSec); ++pi.hollowRuns; if(MemoryAnalysis::DetectProcessHollowing(pi.pid,det) && AlertAllowed(pi.pid,XDR::EventType::AlertProcessHollowing,0)){ pi.hollowAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertProcessHollowing,det); } }
             if(!pi.reflMemAlerted && alive>=3 && alive<=300 && now>=pi.nextReflCheck && pi.reflRuns<g_settings.reflectiveCheckMaxRuns){ std::wstring det; pi.nextReflCheck = now + seconds(g_settings.reflectiveCheckIntervalSec); ++pi.reflRuns; if(MemoryAnalysis::DetectReflectiveLoading(pi.pid,det) && AlertAllowed(pi.pid,XDR::EventType::AlertReflectiveMemory,0)){ pi.reflMemAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertReflectiveMemory,det); } }
-            if(now>=pi.nextExecClassify){ pi.nextExecClassify = now + seconds(g_settings.execClassifyIntervalSec); ClassifyExecRegions(hwnd,pi); }
+            if(g_settings.enableCodeCaveDetection && alive>=5 && alive<=600 && now>=pi.nextCodeCaveScan && pi.codeCaveScanRuns<g_settings.codeCaveCheckMaxRuns){ pi.nextCodeCaveScan = now + seconds(g_settings.codeCaveCheckIntervalSec); ++pi.codeCaveScanRuns; auto caves = CodeCaveDetection::DetectCodeCaves(pi.pid); for(const auto& cave : caves){ if(pi.alertedCodeCaves.insert(cave.location).second && AlertAllowed(pi.pid,XDR::EventType::AlertApiHook,cave.location)){ EmitCodeCaveAlert(hwnd,pi.pid,pi.image,cave); } } }
+            if(now>=pi.nextExecClassify){ 
+                pi.nextExecClassify = now + seconds(g_settings.execClassifyIntervalSec); 
+                ClassifyExecRegions(hwnd,pi); 
+            }
             CheckApiHooks(hwnd,pi);
         }
     }

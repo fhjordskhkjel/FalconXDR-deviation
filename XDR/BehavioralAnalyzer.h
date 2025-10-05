@@ -17,6 +17,7 @@ namespace Behavioral {
         bool enableExecRegionClassifier = true;     // toggle entropy/density exec region classifier
         bool enableInjectionHeuristic = true;       // toggle legacy injection heuristic scan
         bool enableParentChildAnomaly = true;       // toggle parent-child anomaly and cmdline checks
+        bool enableCodeCaveDetection = true;        // toggle code cave detection
         // Persistence / registry
         bool enableAutorunScan = true;              // monitor autorun keys
         bool enableServiceScan = true;              // monitor new/modified services
@@ -30,6 +31,8 @@ namespace Behavioral {
         int hollowCheckMaxRuns = 8;                 // cap hollowing checks
         int reflectiveCheckIntervalSec = 30;        // cadence for reflective loading check
         int reflectiveCheckMaxRuns = 8;             // cap reflective checks
+        int codeCaveCheckIntervalSec = 45;          // cadence for code cave detection
+        int codeCaveCheckMaxRuns = 6;               // cap code cave checks
         
         // YARA throttling budgets
         size_t yaraGlobalBytesPerMin = 8ull * 1024ull * 1024ull; // global per-minute scan budget
