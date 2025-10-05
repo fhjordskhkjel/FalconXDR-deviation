@@ -17,7 +17,7 @@
 #include "QueryDialog.h"
 #include "ScreenshotMonitor.h"
 #include "BehavioralAnalyzer.h"
-#include "DriverManager" // fixed include extension
+#include "DriverManager.h"
 #include "MemoryAnalysis.h"
 #include "Utilities.h"
 #include "ProcessMonitor.h"
