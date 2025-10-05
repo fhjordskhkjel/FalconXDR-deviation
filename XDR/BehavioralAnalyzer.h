@@ -51,4 +51,13 @@ namespace Behavioral {
     void AnalyzeProcessMemoryAsync(DWORD pid, HWND hwnd);
     void StartBackground(HWND hwnd);
     void StopBackground();
+    
+    // Queue statistics
+    struct QueueStats {
+        size_t scanQueueSize;
+        size_t yaraQueueSize;
+        size_t scanQueueHighPrio;
+        size_t scanQueueCriticalPrio;
+    };
+    QueueStats GetQueueStats();
 }

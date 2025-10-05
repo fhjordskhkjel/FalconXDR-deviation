@@ -812,4 +812,29 @@ namespace Behavioral {
     }
 
     void AnalyzeProcessMemoryAsync(DWORD pid, HWND hwnd){ std::thread([pid,hwnd]{ AnalyzeProcessMemory(pid,hwnd); }).detach(); }
+    
+    QueueStats GetQueueStats(){
+        QueueStats stats{};
+        // Get YARA queue size
+        {
+            std::lock_guard lk(g_yaraM);
+            stats.yaraQueueSize = g_yaraTasks.size();
+        }
+        // Get scan queue stats (need to access ScanScheduler internals)
+        // For now, we'll access through the global instance
+        // Note: This requires making the internal data accessible or counting manually
+        // Since we can't easily access the priority_queue size without popping,
+        // we'll track this differently. For now, just return queue size as approximate.
+        stats.scanQueueSize = g_procs.size(); // Approximate - all monitored processes
+        stats.scanQueueHighPrio = 0;
+        stats.scanQueueCriticalPrio = 0;
+        
+        // Count high/critical priority processes based on risk level
+        for(const auto& [pid, pi] : g_procs){
+            if(pi.riskLevel == ProcessRiskProfile::Risk::High) stats.scanQueueHighPrio++;
+            if(pi.riskLevel == ProcessRiskProfile::Risk::Critical) stats.scanQueueCriticalPrio++;
+        }
+        
+        return stats;
+    }
 }

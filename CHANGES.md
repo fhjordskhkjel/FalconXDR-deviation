@@ -143,14 +143,41 @@ When testing on Windows:
 - Memory dumping requires PROCESS_VM_READ permission
 - Very large memory regions may take time to dump
 - Region window is modal per-process (one window per PID)
-- No color highlighting for suspicious rows (text marker only)
+
+## Recent Updates (Queue Scanning & UI Enhancements)
+
+### Queue Status Visualization
+- **Added real-time queue statistics** to the status bar:
+  - `Scan:X` - Number of processes being monitored
+  - `Y:X` - YARA queue size (pending scans)
+  - `H:X` - High priority processes
+  - `C:X` - Critical priority processes
+- Queue information updates every second
+- Helps monitor system load and scanning progress
+
+### Color-Coded Memory Regions
+- **Implemented colored row highlighting** in Memory Regions window:
+  - 🔴 **Red background** - Suspicious regions (executable+writable, PE headers in private memory)
+  - 🟡 **Yellow background** - RWX regions (Read-Write-Execute, potential security risk)
+  - 🟢 **Green background** - Normal regions (safe memory)
+- Makes it much easier to identify potentially dangerous memory regions at a glance
+- Color coding is automatic based on region properties
+
+### Enhanced Alert Severity Colors
+- **Improved alert color system** with 4 distinct levels:
+  - 🔴 **Critical (Bright Red)** - ProcessHollowing, ReflectiveMemory, ApiHookSuspicious, KerberosExtraction
+  - 🟠 **High (Orange-Red)** - ProcessInjection, DllInjection, PrivilegedExec, LsassAccess
+  - 🟡 **Medium (Orange)** - SuspiciousProcess, ApiHook, UnsignedModule, SuspiciousExecRegion
+  - 🟢 **Low (Yellow)** - YaraMatch, ScreenshotCaptured (informational)
+- More distinct colors for better visual differentiation
+- Helps prioritize security response
 
 ## Future Enhancements
 
 Possible improvements:
-- Custom draw for colored rows in region list
 - Hex viewer for dumped memory
 - String search within memory regions
 - Comparison between multiple dumps
 - Auto-YARA scan on dumped regions
 - Process tree view with memory info
+- Historical queue statistics tracking
