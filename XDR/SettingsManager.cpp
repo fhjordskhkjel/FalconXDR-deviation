@@ -66,6 +66,16 @@ void LoadSettings(UISettings& ui, Behavioral::Settings& behavior) {
         else if (k == L"enableYaraReg") {
             behavior.enableYaraRegionScan = (v == L"1");
         }
+        else if (k == L"enableCodeCaves") {
+            behavior.enableCodeCaveDetection = (v == L"1");
+        }
+        else if (k == L"enableIATHooks") {
+            // alias of ApiHook scan toggle
+            behavior.enableApiHookScan = (v == L"1");
+        }
+        else if (k == L"enableCodeCaveBps") {
+            behavior.enableCodeCaveBreakpointDetect = (v == L"1");
+        }
     }
 }
 
@@ -86,6 +96,9 @@ void SaveSettings(const UISettings& ui, const Behavioral::Settings& behavior) {
     f << L"enableThreadScan " << (behavior.enableThreadScan ? 1 : 0) << L"\n";
     f << L"enableProtTrans " << (behavior.enableProtTransitions ? 1 : 0) << L"\n";
     f << L"enableYaraReg " << (behavior.enableYaraRegionScan ? 1 : 0) << L"\n";
+    f << L"enableCodeCaves " << (behavior.enableCodeCaveDetection ? 1 : 0) << L"\n";
+    f << L"enableIATHooks " << (behavior.enableApiHookScan ? 1 : 0) << L"\n";
+    f << L"enableCodeCaveBps " << (behavior.enableCodeCaveBreakpointDetect ? 1 : 0) << L"\n";
 }
 
 } // namespace Settings

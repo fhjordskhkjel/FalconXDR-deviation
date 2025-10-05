@@ -2,6 +2,7 @@
 #include <psapi.h>
 #include <algorithm>
 #include <memory>
+#include "BehavioralAnalyzer.h"
 
 #pragma comment(lib, "psapi.lib")
 
@@ -16,7 +17,7 @@ static std::wstring Lower(const std::wstring& s) {
 
 // TOCTOU-protected memory read
 // Reads memory twice and compares to detect modification during scan (evasion attempt)
-static bool SecureMemoryRead(HANDLE hProcess, LPVOID address, void* buffer, SIZE_T size, SIZE_T* bytesRead = nullptr) {
+static bool SecureMemoryRead(HANDLE hProcess, LPCVOID address, void* buffer, SIZE_T size, SIZE_T* bytesRead = nullptr) {
     if (!hProcess || !address || !buffer || size == 0) return false;
     
     std::vector<uint8_t> temp1(size), temp2(size);
@@ -196,9 +197,9 @@ static bool DetectModulePatches(HANDLE hp, HMODULE hMod, std::vector<CodeCave>& 
                             }
                             cave.size = patchSize;
                             
-                            // Store original bytes
+                            // Store patched (in-memory) bytes
                             size_t cpySize = (std::min)(patchSize, sizeof(cave.originalBytes));
-                            memcpy(cave.originalBytes, diskBuf + j, cpySize);
+                            memcpy(cave.originalBytes, memBuf.data() + j, cpySize);
                             
                             caves.push_back(cave);
                             foundPatches = true;
@@ -263,7 +264,7 @@ std::vector<CodeCave> DetectCodeCaves(DWORD pid) {
             }
             
             // Check for suspicious breakpoints (if not being debugged)
-            if (!isDebugged) {
+            if (!isDebugged && Behavioral::GetSettings().enableCodeCaveBreakpointDetect) {
                 size_t bpCount = 0;
                 if (HasSuspiciousBreakpoints(buf.data(), br, bpCount)) {
                     CodeCave cave;

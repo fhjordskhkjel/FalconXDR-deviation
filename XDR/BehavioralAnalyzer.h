@@ -18,6 +18,7 @@ namespace Behavioral {
         bool enableInjectionHeuristic = true;       // toggle legacy injection heuristic scan
         bool enableParentChildAnomaly = true;       // toggle parent-child anomaly and cmdline checks
         bool enableCodeCaveDetection = true;        // toggle code cave detection
+        bool enableCodeCaveBreakpointDetect = true; // toggle suspicious INT3 breakpoint heuristic in codecaves
         // Persistence / registry
         bool enableAutorunScan = true;              // monitor autorun keys
         bool enableServiceScan = true;              // monitor new/modified services

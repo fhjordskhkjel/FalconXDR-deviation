@@ -631,7 +631,7 @@ static void ScanThreads(HWND hwnd){
                             SIZE_T br=0; 
                             ReadProcessMemory(hp,mbi.BaseAddress,sample,sizeof(sample),&br); 
                             uint64_t h=Fnv1a64(sample,std::min<SIZE_T>(br,64)); 
-                            double ent=Entropy(sample,std::min<SIZE_T>(br,128)); 
+                            double ent=Entropy(sample,std::min<SIZE_T>(br,128)); auto ind = ShellcodeDetection::Analyze(sample, (size_t)br); 
                             
                             if(AlertAllowed(pi.pid,XDR::EventType::AlertProcessInjection,0)){ 
                                 std::wstringstream ds; 
@@ -682,7 +682,7 @@ static void EmitCodeCaveAlert(HWND hwnd, DWORD pid, const std::wstring& image, c
        << L" module=" << cave.moduleContext;
     
     if (cave.isHooked) {
-        ds << L" hooked=1 original_bytes=";
+        ds << L" hooked=1 patched_bytes=";
         for (size_t i = 0; i < std::min<size_t>(cave.size, 16); i++) {
             if (i > 0) ds << L" ";
             ds << std::hex << std::uppercase << std::setw(2) << std::setfill(L'0') << (int)cave.originalBytes[i];
@@ -801,13 +801,13 @@ namespace Behavioral {
             if(!pi.injAlerted && alive>=2 && alive<=180 && now>=pi.nextInjHeur && pi.injHeurRuns<g_settings.injHeurMaxRuns){ if(g_settings.enableInjectionHeuristic){ pi.nextInjHeur = now + seconds(g_settings.injHeurIntervalSec); ++pi.injHeurRuns; auto res=ScanForInjectionVerbose(pi.pid); if(res.suspicious && AlertAllowed(pi.pid,XDR::EventType::AlertProcessInjection,0)){ pi.injAlerted=true; std::wstringstream dss; dss<<L"sample="<<res.sample<<L" private_exec_regions="<<res.privateExecRegions<<L" writable_exec_regions="<<res.writableExecRegions; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertProcessInjection,dss.str()); } } }
             if(!pi.hollowAlerted && alive>=3 && alive<=300 && now>=pi.nextHollowCheck && pi.hollowRuns<g_settings.hollowCheckMaxRuns){ std::wstring det; pi.nextHollowCheck = now + seconds(g_settings.hollowCheckIntervalSec); ++pi.hollowRuns; if(MemoryAnalysis::DetectProcessHollowing(pi.pid,det) && AlertAllowed(pi.pid,XDR::EventType::AlertProcessHollowing,0)){ pi.hollowAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertProcessHollowing,det); } }
             if(!pi.reflMemAlerted && alive>=3 && alive<=300 && now>=pi.nextReflCheck && pi.reflRuns<g_settings.reflectiveCheckMaxRuns){ std::wstring det; pi.nextReflCheck = now + seconds(g_settings.reflectiveCheckIntervalSec); ++pi.reflRuns; if(MemoryAnalysis::DetectReflectiveLoading(pi.pid,det) && AlertAllowed(pi.pid,XDR::EventType::AlertReflectiveMemory,0)){ pi.reflMemAlerted=true; EmitGeneric(hwnd,pi.pid,pi.image,XDR::EventType::AlertReflectiveMemory,det); } }
-            if(g_settings.enableCodeCaveDetection && alive>=5 && alive<=600 && now>=pi.nextCodeCaveScan && pi.codeCaveScanRuns<g_settings.codeCaveCheckMaxRuns){ pi.nextCodeCaveScan = now + seconds(g_settings.codeCaveCheckIntervalSec); ++pi.codeCaveScanRuns; auto caves = CodeCaveDetection::DetectCodeCaves(pi.pid); for(const auto& cave : caves){ if(pi.alertedCodeCaves.insert(cave.location).second && AlertAllowed(pi.pid,XDR::EventType::AlertApiHook,cave.location)){ EmitCodeCaveAlert(hwnd,pi.pid,pi.image,cave); } } }
-            if(now>=pi.nextExecClassify){ 
-                pi.nextExecClassify = now + seconds(g_settings.execClassifyIntervalSec); 
-                ClassifyExecRegions(hwnd,pi); 
-            }
-            CheckApiHooks(hwnd,pi);
-            CheckIATHooks(hwnd,pi);
+            if(g_settings.enableCodeCaveDetection && alive>=5 && alive<=600 && now>=pi.nextCodeCaveScan && pi.codeCaveScanRuns<g_settings.codeCaveCheckMaxRuns){ pi.nextCodeCaveScan = now + seconds(g_settings.codeCaveCheckIntervalSec); ++pi.codeCaveScanRuns; auto caves = CodeCaveDetection::DetectCodeCaves(pi.pid); for(const auto& cave : caves){
+                if(!g_settings.enableCodeCaveBreakpointDetect){
+                    std::wstring reasonLower = lower(cave.detectionReason);
+                    if(reasonLower.rfind(L"suspicious_breakpoints",0)==0) continue;
+                }
+                if(pi.alertedCodeCaves.insert(cave.location).second && AlertAllowed(pi.pid,XDR::EventType::AlertApiHook,cave.location)){ EmitCodeCaveAlert(hwnd,pi.pid,pi.image,cave); }
+            } }
         }
     }
 
